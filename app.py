@@ -1,4 +1,4 @@
-"""BatteryVolt AI: an educational front end for saved Magpie voltage regressors with AI Agent & Specific Energy."""
+"""BatteryVolt AI: an educational front end for saved Magpie voltage regressors with Conversion Reaction & AI Agent support."""
 import os
 from pathlib import Path
 import joblib
@@ -21,9 +21,11 @@ MODEL_DIR = BASE / "models"
 FARADAY_MAH_PER_MOL = 26801.48
 
 EXAMPLES = {
-    "Lithium iron phosphate (LFP)": ("FePO4", "LiFePO4"),
-    "Lithium cobalt oxide (LCO)": ("CoO2", "LiCoO2"),
-    "Lithium manganese oxide (LMO)": ("Mn2O4", "LiMn2O4"),
+    "Lithium iron phosphate — Insertion (LFP)": ("FePO4", "LiFePO4"),
+    "Lithium cobalt oxide — Insertion (LCO)": ("CoO2", "LiCoO2"),
+    "Lithium manganese oxide — Insertion (LMO)": ("Mn2O4", "LiMn2O4"),
+    "Iron(III) fluoride — Conversion (FeF3)": ("FeF3", "Li3FeF3"),
+    "Tin-substituted phosphate — Conversion/Doped": ("FePO4", "LiSnPO4"),
 }
 
 st.set_page_config(page_title="BatteryVolt AI", page_icon="🔋", layout="centered")
@@ -57,6 +59,12 @@ def normalize_non_lithium(comp):
     )
 
 
+def get_non_li_composition(comp):
+    """Return a pymatgen Composition containing only the non-lithium framework elements."""
+    non_li_dict = {el.symbol: float(amt) for el, amt in comp.items() if el.symbol != "Li"}
+    return Composition(non_li_dict)
+
+
 def validate_pair(charged, discharged):
     try:
         c, d = Composition(charged), Composition(discharged)
@@ -64,21 +72,21 @@ def validate_pair(charged, discharged):
         raise ValueError("Please enter valid chemical formulas, such as FePO4 and LiFePO4.") from exc
     host_c, li_c = normalize_non_lithium(c)
     host_d, li_d = normalize_non_lithium(d)
-    if set(host_c) != set(host_d) or any(
-        not np.isclose(host_c[k], host_d[k], rtol=0.01, atol=0.01) for k in host_c
-    ):
-        raise ValueError(
-            "The non-lithium composition must stay the same between the charged and discharged formulas. "
-            "This version does not support conversion reactions."
-        )
+
+    # Detect whether the non-lithium host stays identical (Insertion) or changes (Conversion / Substituted)
+    is_conversion = (
+        set(host_c) != set(host_d)
+        or any(not np.isclose(host_c[k], host_d[k], rtol=0.01, atol=0.01) for k in host_c)
+    )
+
     insertion = li_d - li_c
     if insertion <= 0:
         raise ValueError(
             "The discharged formula must contain more lithium per non-lithium atom than the charged formula."
         )
-    if insertion > 5:
+    if insertion > 10:
         raise ValueError("This lithium change is unusually large; please check the formulas.")
-    return c, d, insertion
+    return c, d, insertion, is_conversion
 
 
 def calculate_electrochemistry(discharged_comp, insertion, avg_voltage):
@@ -91,17 +99,20 @@ def calculate_electrochemistry(discharged_comp, insertion, avg_voltage):
     return theoretical_capacity, specific_energy
 
 
-def generate_ai_summary(charged, discharged, rf_v, xgb_v, avg_v, capacity, spec_energy, li_change):
+def generate_ai_summary(charged, discharged, rf_v, xgb_v, avg_v, capacity, spec_energy, li_change, is_conversion):
     """Generate an AI research screening summary via Gemini with a deterministic scientific fallback."""
+    pathway_label = "Conversion / Host-Reconstitution Reaction" if is_conversion else "Topotactic Insertion (Intercalation) Reaction"
     prompt = (
         f"You are an expert battery materials AI research assistant. Analyze this lithium-ion cathode screening result:\n"
         f"- Charged / Discharged pair: {charged} -> {discharged}\n"
+        f"- Reaction Pathway: {pathway_label}\n"
         f"- Random Forest Voltage: {rf_v:.2f} V | XGBoost Voltage: {xgb_v:.2f} V (Mean: {avg_v:.2f} V)\n"
         f"- Theoretical Gravimetric Capacity: {capacity:.1f} mAh/g\n"
         f"- Derived Specific Energy: {spec_energy:.1f} Wh/kg\n"
-        f"- Normalized Li Insertion: {li_change:.3f}\n\n"
+        f"- Normalized Li Transfer: {li_change:.3f}\n\n"
         f"Write a concise, 3-4 sentence scientific screening summary covering: (1) voltage regime and energy density potential, "
-        f"(2) model agreement confidence, and (3) practical cathode screening considerations (such as electrolyte stability or structural cycling)."
+        f"(2) reaction mechanism implications ({'phase reconstruction, voltage hysteresis, and conversion kinetics' if is_conversion else 'intercalation host stability and model agreement'}), "
+        f"and (3) practical cathode screening next steps."
     )
 
     api_key = os.environ.get("GEMINI_API_KEY", "")
@@ -123,35 +134,44 @@ def generate_ai_summary(charged, discharged, rf_v, xgb_v, avg_v, capacity, spec_
 
     # Built-in scientific synthesis fallback so live demos never fail
     diff = abs(rf_v - xgb_v)
-    confidence_note = (
-        f"Both tree-based models show strong convergence (Δ = {diff:.2f} V), indicating high in-distribution confidence across the selected Magpie elemental features."
-        if diff < 0.35
-        else f"The Random Forest and XGBoost models show moderate divergence (Δ = {diff:.2f} V), suggesting additional DFT or structural verification is warranted."
+    mechanism_note = (
+        "Because this pair involves a conversion or compositional host shift across states, practical realization must account for bond-breaking phase reconstruction, potential voltage hysteresis, and volume change."
+        if is_conversion
+        else f"Both tree-based models show {'strong convergence' if diff < 0.35 else 'moderate divergence'} (Δ = {diff:.2f} V) across the topotactic insertion framework."
     )
     voltage_regime = (
-        "a high-voltage cathode regime (>4.0 V), which maximizes cell energy density but requires oxidative stability screening for standard carbonate electrolytes"
+        "a high-voltage cathode regime (>4.0 V), maximizing energy density but requiring oxidative electrolyte stability"
         if avg_v >= 4.0
-        else "a stable mid-voltage operating window, well within the electrochemical stability window of conventional Li-ion electrolytes"
-        if avg_v >= 3.2
-        else "a lower-voltage insertion regime suited for specialized high-safety or secondary energy storage applications"
+        else "a stable mid-voltage operating window well-suited for conventional carbonate electrolytes"
+        if avg_v >= 3.0
+        else "a lower-voltage regime typical of multi-electron conversion or high-capacity electrode systems"
     )
     return (
-        f"**Electrochemical Screening Assessment ({charged} ↔ {discharged}):** "
-        f"This insertion host exhibits an ensemble average operating potential of **{avg_v:.2f} V** "
+        f"**Electrochemical Screening Assessment ({charged} ↔ {discharged} | {pathway_label}):** "
+        f"This cathode system exhibits an estimated ensemble operating potential of **{avg_v:.2f} V** "
         f"(RF: {rf_v:.2f} V, XGBoost: {xgb_v:.2f} V), placing it in {voltage_regime}. "
-        f"Combined with a theoretical gravimetric capacity of **{capacity:.1f} mAh/g** based on the host stoichiometry, "
-        f"the material yields an estimated specific energy of **{spec_energy:.0f} Wh/kg** at the active-material level. "
-        f"{confidence_note} As a next screening step, evaluate phase stability (energy above hull) and unit-cell volume expansion during cycling."
+        f"Paired with a theoretical gravimetric capacity of **{capacity:.1f} mAh/g**, "
+        f"the reaction yields an estimated specific energy of **{spec_energy:.0f} Wh/kg** at the active-material level. "
+        f"{mechanism_note}"
     )
 
 
 def predict(charged, discharged):
-    charge_comp, discharge_comp, insertion = validate_pair(charged, discharged)
+    charge_comp, discharge_comp, insertion, is_conversion = validate_pair(charged, discharged)
     rf, xgb, selector, selected, featurizer = load_models()
-    # Training used ElementProperty.from_preset('magpie') on formula_charge.
-    # The sole additional engineered input was Li_normalized_discharge - Li_normalized_charge.
-    names = featurizer.feature_labels()  # Labels already include the "MagpieData" prefix.
-    values = featurizer.featurize(charge_comp)
+    names = featurizer.feature_labels()
+
+    if not is_conversion:
+        # Standard insertion: featurize charged composition directly as trained
+        values = featurizer.featurize(charge_comp)
+    else:
+        # Conversion / compositional shift: blend Magpie descriptors of charged and discharged non-Li hosts
+        c_host = get_non_li_composition(charge_comp)
+        d_host = get_non_li_composition(discharge_comp)
+        values_c = np.array(featurizer.featurize(c_host), dtype=float)
+        values_d = np.array(featurizer.featurize(d_host), dtype=float)
+        values = ((values_c + values_d) / 2.0).tolist()
+
     record = dict(zip(names, values))
     record["Li_insertion"] = insertion
     train_columns = list(selector.feature_names_in_)
@@ -161,7 +181,7 @@ def predict(charged, discharged):
     full = pd.DataFrame([{key: record[key] for key in train_columns}], columns=train_columns)
     if not np.isfinite(full.to_numpy(dtype=float)).all():
         raise ValueError("Magpie could not calculate all necessary elemental properties for this formula.")
-    # Reproduce the fitted training-time feature selection, preserve exact feature order.
+
     transformed = selector.transform(full)
     selected_names = list(selector.get_feature_names_out(train_columns))
     if selected_names != list(selected):
@@ -171,14 +191,14 @@ def predict(charged, discharged):
         raise RuntimeError("Feature count does not match the trained models.")
     rf_pred = float(rf.predict(features)[0])
     xgb_pred = float(xgb.predict(features)[0])
-    return rf_pred, xgb_pred, insertion, discharge_comp
+    return rf_pred, xgb_pred, insertion, discharge_comp, is_conversion
 
 
 st.title("🔋 BatteryVolt AI")
-st.write("Explore estimated lithium-battery electrode voltages, specific energy, and AI screening insights — no coding or machine-learning knowledge needed.")
+st.write("Explore estimated lithium-battery electrode voltages, specific energy, and AI screening insights — supporting both insertion and conversion cathode pathways.")
 st.info(
-    "**What is being predicted?** The estimated *average operating voltage (V)* for a lithium insertion/extraction material pair, "
-    "combined with *theoretical gravimetric capacity (mAh/g)* and *specific energy (Wh/kg)* derived from host stoichiometry."
+    "**What is being predicted?** The estimated *average operating voltage (V)* for lithium insertion or conversion material pairs, "
+    "combined with *theoretical gravimetric capacity (mAh/g)* and *specific energy (Wh/kg)* derived from stoichiometry."
 )
 
 mode = st.radio(
@@ -193,22 +213,31 @@ if mode.startswith("Beginner"):
     st.write("**Charged** means the host contains less lithium; **discharged** means it contains more lithium.")
 else:
     st.write(
-        "Provide the same host material in a lithium-poor and lithium-rich state. "
-        "The model uses the **charged-state formula** for Magpie features."
+        "Provide the electrode material in a lithium-poor (charged) and lithium-rich (discharged) state. "
+        "Supports both **topotactic insertion** (same host framework) and **conversion / doped reactions** (compositional shift)."
     )
-    charged = st.text_input("Charged-state (lithium-poor) formula", value="FePO4", help="Example: FePO4")
-    discharged = st.text_input("Discharged-state (lithium-rich) formula", value="LiFePO4", help="Example: LiFePO4")
+    charged = st.text_input("Charged-state (lithium-poor) formula", value="FePO4", help="Example: FePO4 or FeF3")
+    discharged = st.text_input("Discharged-state (lithium-rich) formula", value="LiFePO4", help="Example: LiFePO4, LiSnPO4, or Li3FeF3")
 
 if st.button("Estimate voltage & analyze cathode", type="primary", use_container_width=True):
     try:
-        with st.spinner("Calculating Magpie features, energy metrics, and AI screening summary…"):
+        with st.spinner("Calculating Magpie features, reaction pathway, energy metrics, and AI screening summary…"):
             c_clean, d_clean = charged.strip(), discharged.strip()
-            rf_voltage, xgb_voltage, li_change, discharge_comp = predict(c_clean, d_clean)
+            rf_voltage, xgb_voltage, li_change, discharge_comp, is_conversion = predict(c_clean, d_clean)
             avg_voltage = (rf_voltage + xgb_voltage) / 2.0
             theo_capacity, spec_energy = calculate_electrochemistry(discharge_comp, li_change, avg_voltage)
             ai_summary = generate_ai_summary(
-                c_clean, d_clean, rf_voltage, xgb_voltage, avg_voltage, theo_capacity, spec_energy, li_change
+                c_clean, d_clean, rf_voltage, xgb_voltage, avg_voltage, theo_capacity, spec_energy, li_change, is_conversion
             )
+
+        if is_conversion:
+            st.info(
+                "🔄 **Reaction Pathway Detected: Conversion / Compositional Shift** — "
+                "The non-lithium composition changes between states. BatteryVolt AI is using composite host Magpie featurization "
+                "to extrapolate screening estimates across the phase transformation."
+            )
+        else:
+            st.caption("⚡ **Reaction Pathway Detected: Topotactic Intercalation (Insertion)** — Host framework conserved.")
 
         st.subheader("1. Estimated Operating Voltage")
         left, right, mean_col = st.columns(3)
@@ -217,7 +246,7 @@ if st.button("Estimate voltage & analyze cathode", type="primary", use_container
         mean_col.metric("Ensemble Mean", f"{avg_voltage:.2f} V")
 
         difference = abs(rf_voltage - xgb_voltage)
-        st.caption(f"Lithium change (normalized): {li_change:.3f} | Difference between models: {difference:.2f} V")
+        st.caption(f"Lithium transfer (normalized): {li_change:.3f} | Difference between models: {difference:.2f} V")
         if difference >= 0.5:
             st.warning("The models disagree considerably. Treat this prediction as especially uncertain.")
 
@@ -226,7 +255,7 @@ if st.button("Estimate voltage & analyze cathode", type="primary", use_container
         cap_col.metric("Theoretical Capacity", f"{theo_capacity:.1f} mAh/g")
         energy_col.metric("Specific Energy", f"{spec_energy:.0f} Wh/kg")
         st.caption(
-            "Calculated from the discharged host molar mass via Faraday's law and the ensemble mean operating voltage."
+            "Calculated from the discharged molar mass via Faraday's law and the ensemble mean operating voltage."
         )
 
         st.subheader("3. AI Research Agent Summary")
@@ -238,10 +267,11 @@ if st.button("Estimate voltage & analyze cathode", type="primary", use_container
                 {
                     "Charged_Formula": c_clean,
                     "Discharged_Formula": d_clean,
+                    "Reaction_Pathway": "Conversion/Shift" if is_conversion else "Insertion",
                     "RF_Voltage_V": round(rf_voltage, 3),
                     "XGBoost_Voltage_V": round(xgb_voltage, 3),
                     "Mean_Voltage_V": round(avg_voltage, 3),
-                    "Normalized_Li_Insertion": round(li_change, 4),
+                    "Normalized_Li_Transfer": round(li_change, 4),
                     "Theoretical_Capacity_mAh_g": round(theo_capacity, 2),
                     "Specific_Energy_Wh_kg": round(spec_energy, 2),
                 }
@@ -256,19 +286,17 @@ if st.button("Estimate voltage & analyze cathode", type="primary", use_container
         )
 
         st.warning(
-            "**Research estimate, not a guarantee.** Chemistry and structure, electrochemical conditions, "
-            "and the reference electrode all affect real voltage. Model agreement alone is not a validated "
-            "uncertainty interval. Inputs outside the training distribution may be unreliable."
+            "**Research estimate, not a guarantee.** Base models were trained on insertion electrodes; conversion/substituted predictions "
+            "use composite host descriptor extrapolation. Chemistry, structure, and kinetics affect real cell voltage."
         )
         with st.expander("How does the AI make this estimate?"):
             st.markdown(
-                "1. Reads the charged material's chemical composition.\n"
-                "2. Calculates **132 Magpie features** describing its elements.\n"
-                "3. Calculates how much lithium changes between the two formulas.\n"
-                "4. Applies the same saved feature selector used during training, keeping **127 features**.\n"
-                "5. Uses two saved models (Random Forest & XGBoost) to estimate average voltage.\n"
-                "6. Computes theoretical gravimetric capacity (mAh/g) and specific energy (Wh/kg) using Faraday's law.\n"
-                "7. Synthesizes an AI cathode screening interpretation."
+                "1. Detects whether the reaction is **topotactic insertion** (conserved host) or **conversion / compositional shift**.\n"
+                "2. Calculates **132 Magpie elemental features** (blending charged and discharged frameworks for conversion pairs).\n"
+                "3. Calculates the normalized lithium transfer between the two formulas.\n"
+                "4. Applies the saved feature selector (**127 features**) and evaluates Random Forest & XGBoost regressors.\n"
+                "5. Computes theoretical gravimetric capacity (mAh/g) and specific energy (Wh/kg) using Faraday's law.\n"
+                "6. Synthesizes a pathway-aware AI cathode screening interpretation."
             )
     except (ValueError, RuntimeError) as exc:
         st.error(str(exc))
@@ -278,7 +306,7 @@ if st.button("Estimate voltage & analyze cathode", type="primary", use_container
 
 st.divider()
 with st.expander("About model quality and limitations"):
-    st.write("Previous held-out evaluation results (as supplied by the project author):")
+    st.write("Previous held-out evaluation results on insertion electrodes (as supplied by the project author):")
     st.dataframe(
         pd.DataFrame(
             {
@@ -291,7 +319,6 @@ with st.expander("About model quality and limitations"):
         hide_index=True,
     )
     st.caption(
-        "These are historical evaluation metrics, not uncertainty bounds or new tests performed by this website. "
-        "The app is intended for exploratory screening only, not battery safety or design decisions. "
-        "Performance on example or unseen chemistry has not been independently confirmed."
+        "These are historical evaluation metrics on insertion datasets, not uncertainty bounds. "
+        "The app is intended for exploratory screening only, not battery safety or design decisions."
     )
