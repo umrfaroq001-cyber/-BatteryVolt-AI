@@ -1,6 +1,5 @@
 ## Contributors
 - **[Rabia Noor](https://github.com/rabia202128-dot)** — *Deployment, QA & Documentation*: Managed Python 3.11 dependencies (`requirements.txt`), Streamlit Community Cloud deployment, edge-case testing, and project documentation.
-- `Li_insertion` feature pipeline, `VarianceThreshold` selection, and trained the Random Forest and XGBoost models.
 - **[Ch Aazib](https://github.com/aazibtariq1)** — *Application & Backend Development*: Built the two-mode Streamlit interface (`app.py`), chemical formula validation, and safe `.joblib` model loading logic.
 - **[Umer Farooq](https://github.com/umrfaroq001-cyber)** — *Machine Learning & Feature Engineering*: Designed the 132 Magpie + 
 
